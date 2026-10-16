@@ -1,7 +1,7 @@
 use std::thread::sleep;
 use std::time::Duration;
 
-use esp_idf_svc::hal::gpio::{Output, PinDriver};
+use esp_idf_svc::hal::gpio::{Output, PinDriver, Pull};
 use esp_idf_svc::hal::peripherals::Peripherals;
 use esp_idf_svc::sys::EspError;
 
@@ -109,17 +109,119 @@ fn main() -> Result<(), EspError> {
     let load_pin = PinDriver::output(peripherals.pins.gpio40)?;
     let clk_pin = PinDriver::output(peripherals.pins.gpio41)?;
 
+    // Entradas
+    let boton_i = PinDriver::input(peripherals.pins.gpio46, Pull::Up)?;
+    let boton_r = PinDriver::input(peripherals.pins.gpio3, Pull::Up)?;
+
     let mut sr = ShiftRegister595::new(data_pin, clr_pin, load_pin, clk_pin)?;
 
     log::info!("Secuencia: Encendiendo un LED a la vez (Q0 a Q7)...");
 
+    let mut min: u8 = 0;
+    let mut seg: u8 = 0;
+
+    let mut ec: bool = false;
+
+    sr.send_byte(decto7seg(0))?;
+    sr.send_byte(decto7seg(0))?;
+    sr.send_byte(decto7seg(0))?;
+
     loop {
-        // Enciende un LED a la vez del bit 0 (Q0) al bit 7 (Q7)
-        for i in 0..8 {
-            let pattern = 1u8 << i;
-            log::info!("Enviando patrón: 0b{:08b} (LED {})", pattern, i);
-            sr.send_byte(pattern)?;
-            sleep(Duration::from_millis(1000));
+        log::info!(
+            "BotonI {}     BotonR {}",
+            boton_i.is_low(),
+            boton_r.is_low()
+        );
+        //1//for x in 0..=200 {
+        //1//    let c: u8 = x / 100;
+        //1//    let d: u8 = (x - c * 100) / 10;
+        //1//    let u: u8 = x % 10;
+        //1//
+        //1//    sr.send_byte(decto7seg(u))?;
+        //1//    sr.send_byte(decto7seg(d))?;
+        //1//    sr.send_byte(decto7seg(c))?;
+        //1//
+        //1//    sleep(Duration::from_millis(100));
+        //1//}
+
+        //2//let ds: u8 = seg / 10;
+        //2//let us: u8 = seg % 10;
+        //2//
+        //2//sr.send_byte(decto7seg(us))?;
+        //2//sr.send_byte(decto7seg(ds))?;
+        //2//sr.send_byte(decto7seg(min))?;
+        //2//
+        //2//sleep(Duration::from_millis(100));
+        //2//
+        //2//seg = seg + 1;
+        //2//if seg == 60 {
+        //2//    seg = 0;
+        //2//    min += 1;
+        //2//    if min == 10 {
+        //2//        min = 0;
+        //2//    }
+        //2//}
+
+        if ec == false && boton_i.is_low() {
+            ec = true;
+
+            while boton_i.is_low() {
+                sleep(Duration::from_millis(100));
+            }
         }
+
+        if ec == true && boton_i.is_low() {
+            ec = false;
+            while boton_i.is_low() {
+                sleep(Duration::from_millis(100));
+            }
+        }
+
+        sleep(Duration::from_millis(100));
+
+        if ec == false && boton_r.is_low() {
+            sr.send_byte(decto7seg(0))?;
+            sr.send_byte(decto7seg(0))?;
+            sr.send_byte(decto7seg(0))?;
+
+            min = 0;
+            seg = 0;
+        }
+
+        if ec == true {
+            seg = seg + 1;
+            if seg == 60 {
+                seg = 0;
+                min += 1;
+                if min == 10 {
+                    min = 0;
+                }
+            }
+
+            let ds: u8 = seg / 10;
+            let us: u8 = seg % 10;
+
+            sr.send_byte(decto7seg(us))?;
+            sr.send_byte(decto7seg(ds))?;
+            sr.send_byte(decto7seg(min))?;
+
+            sleep(Duration::from_millis(900));
+        }
+    }
+}
+
+fn decto7seg(numero: u8) -> u8 {
+    match numero {
+        0 => 0b00111111,
+        1 => 0b00000110,
+        2 => 0b01011011,
+        3 => 0b01001111,
+        4 => 0b01100110,
+        5 => 0b01101101,
+        6 => 0b01111101,
+        7 => 0b00000111,
+        8 => 0b01111111,
+        9 => 0b01100111,
+        _ => 0b00000000,
     }
 }
