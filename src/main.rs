@@ -1,9 +1,14 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::sleep;
 use std::time::Duration;
 
-use esp_idf_svc::hal::gpio::{Output, PinDriver, Pull};
+use esp_idf_svc::hal::gpio::{InterruptType, Output, PinDriver, Pull};
 use esp_idf_svc::hal::peripherals::Peripherals;
 use esp_idf_svc::sys::EspError;
+
+// Banderas atómicas para comunicar las interrupciones con el bucle principal de forma segura
+static BOTON_I_PRESIONADO: AtomicBool = AtomicBool::new(false);
+static BOTON_R_PRESIONADO: AtomicBool = AtomicBool::new(false);
 
 pub struct ShiftRegister595<'d> {
     data: PinDriver<'d, Output>,
@@ -95,7 +100,7 @@ fn main() -> Result<(), EspError> {
     esp_idf_svc::sys::link_patches();
     esp_idf_svc::log::EspLogger::initialize_default();
 
-    log::info!("Iniciando control de 74HC595...");
+    log::info!("Iniciando control de 74HC595 con interrupciones...");
 
     let peripherals = Peripherals::take()?;
 
@@ -109,103 +114,113 @@ fn main() -> Result<(), EspError> {
     let load_pin = PinDriver::output(peripherals.pins.gpio40)?;
     let clk_pin = PinDriver::output(peripherals.pins.gpio41)?;
 
-    // Entradas
-    let boton_i = PinDriver::input(peripherals.pins.gpio46, Pull::Up)?;
-    let boton_r = PinDriver::input(peripherals.pins.gpio3, Pull::Up)?;
-
     let mut sr = ShiftRegister595::new(data_pin, clr_pin, load_pin, clk_pin)?;
 
-    log::info!("Secuencia: Encendiendo un LED a la vez (Q0 a Q7)...");
+    // Entradas con resistencia Pull-Up interna
+    let mut boton_i = PinDriver::input(peripherals.pins.gpio46, Pull::Up)?;
+    let mut boton_r = PinDriver::input(peripherals.pins.gpio3, Pull::Up)?;
+
+    // Configurar tipo de interrupción: NegEdge (flanco de bajada al presionar hacia GND)
+    boton_i.set_interrupt_type(InterruptType::NegEdge)?;
+    boton_r.set_interrupt_type(InterruptType::NegEdge)?;
+
+    // Suscribir manejadores de interrupción (ISR).
+    // Las ISR deben ser mínimas: únicamente activan la bandera atómica.
+    unsafe {
+        boton_i.subscribe(|| {
+            BOTON_I_PRESIONADO.store(true, Ordering::Relaxed);
+        })?;
+
+        boton_r.subscribe(|| {
+            BOTON_R_PRESIONADO.store(true, Ordering::Relaxed);
+        })?;
+    }
+
+    // Habilitar interrupciones
+    boton_i.enable_interrupt()?;
+    boton_r.enable_interrupt()?;
+
+    log::info!("Interrupciones configuradas en boton_i (GPIO46) y boton_r (GPIO3)");
 
     let mut min: u8 = 0;
     let mut seg: u8 = 0;
+    let mut ec: bool = false; // Estado del contador: false = detenido, true = en marcha
 
-    let mut ec: bool = false;
-
+    // Mostrar 00:00 al inicio
     sr.send_byte(decto7seg(0))?;
     sr.send_byte(decto7seg(0))?;
     sr.send_byte(decto7seg(0))?;
 
     loop {
-        log::info!(
-            "BotonI {}     BotonR {}",
-            boton_i.is_low(),
-            boton_r.is_low()
-        );
-        //1//for x in 0..=200 {
-        //1//    let c: u8 = x / 100;
-        //1//    let d: u8 = (x - c * 100) / 10;
-        //1//    let u: u8 = x % 10;
-        //1//
-        //1//    sr.send_byte(decto7seg(u))?;
-        //1//    sr.send_byte(decto7seg(d))?;
-        //1//    sr.send_byte(decto7seg(c))?;
-        //1//
-        //1//    sleep(Duration::from_millis(100));
-        //1//}
+        // --- 1. Gestionar interrupción del botón Inicio / Parada (boton_i) ---
+        if BOTON_I_PRESIONADO.swap(false, Ordering::Relaxed) {
+            ec = !ec;
+            log::info!(
+                "Botón I pulsado: Contador {}",
+                if ec { "INICIADO" } else { "DETENIDO" }
+            );
 
-        //2//let ds: u8 = seg / 10;
-        //2//let us: u8 = seg % 10;
-        //2//
-        //2//sr.send_byte(decto7seg(us))?;
-        //2//sr.send_byte(decto7seg(ds))?;
-        //2//sr.send_byte(decto7seg(min))?;
-        //2//
-        //2//sleep(Duration::from_millis(100));
-        //2//
-        //2//seg = seg + 1;
-        //2//if seg == 60 {
-        //2//    seg = 0;
-        //2//    min += 1;
-        //2//    if min == 10 {
-        //2//        min = 0;
-        //2//    }
-        //2//}
-
-        if ec == false && boton_i.is_low() {
-            ec = true;
-
-            while boton_i.is_low() {
-                sleep(Duration::from_millis(100));
-            }
+            // Tiempo antirrebote y espera para rearmar la interrupción
+            sleep(Duration::from_millis(150));
+            // En esp-idf-hal la interrupción se deshabilita automáticamente al dispararse;
+            // se debe volver a habilitar desde el contexto principal:
+            boton_i.enable_interrupt()?;
         }
 
-        if ec == true && boton_i.is_low() {
-            ec = false;
-            while boton_i.is_low() {
-                sleep(Duration::from_millis(100));
-            }
-        }
-
-        sleep(Duration::from_millis(100));
-
-        if ec == false && boton_r.is_low() {
-            sr.send_byte(decto7seg(0))?;
-            sr.send_byte(decto7seg(0))?;
-            sr.send_byte(decto7seg(0))?;
-
-            min = 0;
-            seg = 0;
-        }
-
-        if ec == true {
-            seg = seg + 1;
-            if seg == 60 {
+        // --- 2. Gestionar interrupción del botón Reset (boton_r) ---
+        if BOTON_R_PRESIONADO.swap(false, Ordering::Relaxed) {
+            if !ec {
+                // Solo se reinicia si el contador está detenido
+                min = 0;
                 seg = 0;
-                min += 1;
-                if min == 10 {
-                    min = 0;
-                }
+                sr.send_byte(decto7seg(0))?;
+                sr.send_byte(decto7seg(0))?;
+                sr.send_byte(decto7seg(0))?;
+                log::info!("Botón R pulsado: Contador reiniciado a 00:00");
+            } else {
+                log::info!("Botón R pulsado ignorado (el contador está en marcha)");
             }
 
-            let ds: u8 = seg / 10;
-            let us: u8 = seg % 10;
+            // Tiempo antirrebote y rearmar la interrupción
+            sleep(Duration::from_millis(150));
+            boton_r.enable_interrupt()?;
+        }
 
-            sr.send_byte(decto7seg(us))?;
-            sr.send_byte(decto7seg(ds))?;
-            sr.send_byte(decto7seg(min))?;
+        // --- 3. Lógica de avance del contador si está en marcha ---
+        if ec {
+            // Dormimos 1 segundo (1000 ms) en intervalos de 50 ms.
+            // Si durante este lapso se pulsa el botón de parada, la interrupción se captura
+            // de inmediato y salimos del ciclo sin esperar a que termine el segundo.
+            for _ in 0..20 {
+                if BOTON_I_PRESIONADO.load(Ordering::Relaxed) {
+                    break;
+                }
+                sleep(Duration::from_millis(50));
+            }
 
-            sleep(Duration::from_millis(900));
+            // Si al finalizar la espera sigue en marcha y no se solicitó parar, incrementamos el tiempo
+            if ec && !BOTON_I_PRESIONADO.load(Ordering::Relaxed) {
+                seg += 1;
+                if seg == 60 {
+                    seg = 0;
+                    min += 1;
+                    if min == 10 {
+                        min = 0;
+                    }
+                }
+
+                let ds: u8 = seg / 10;
+                let us: u8 = seg % 10;
+
+                sr.send_byte(decto7seg(us))?;
+                sr.send_byte(decto7seg(ds))?;
+                sr.send_byte(decto7seg(min))?;
+
+                log::info!("Tiempo: {:02}:{:02}", min, seg);
+            }
+        } else {
+            // Si el contador está detenido, dormimos un breve periodo para ceder la CPU
+            sleep(Duration::from_millis(20));
         }
     }
 }
